@@ -2,12 +2,17 @@
 Bidirectional LSTM (双向LSTM) 模型在 IMDB 情感分析任务上的 PyTorch 实现
 
 此文件是 BidirectionalLSTM.py 的 PyTorch 版本，实现相同的功能。
-参考 SimpleRNN_pytorch.py 的架构。
+参考 SimpleRNN_pytorch.py 的架构，使用本地数据集并添加训练曲线可视化。
 
 Keras 和 PyTorch 的主要区别：
 1. 数据加载：PyTorch 使用 DataLoader 和自定义 Dataset 类
 2. 模型定义：PyTorch 需要继承 nn.Module 类并定义 forward 方法
 3. 训练过程：PyTorch 需要手动编写训练循环
+
+本版本更新：
+1. 使用本地 aclImdb 数据集而非 Keras 内置数据集
+2. 添加训练曲线可视化功能，生成 bidirectional_lstm_training_curves.png
+3. 数据预处理完全在 PyTorch 中完成
 
 双向 LSTM 的优势：
 1. 同时考虑过去和未来的上下文信息
@@ -20,10 +25,12 @@ Embedding → Bidirectional LSTM (只取最后一个时间步) → Dense(sigmoid
 文件结构：
     1. 导入必要的 PyTorch 库
     2. 定义超参数
-    3. 自定义 IMDB Dataset 类
-    4. 构建双向 LSTM 模型类
-    5. 训练和评估函数
-    6. 主程序执行流程
+    3. 辅助函数（序列填充、文本转换）
+    4. 本地 IMDB 数据加载函数
+    5. 构建双向 LSTM 模型类
+    6. 训练和评估函数
+    7. 训练曲线可视化函数
+    8. 主程序执行流程
 """
 
 import torch
@@ -31,12 +38,16 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, TensorDataset
 import torch.nn.functional as F
+import matplotlib
+# 设置matplotlib后端为Agg，避免GUI问题（在无头环境中使用）
+matplotlib.use('Agg')  # 在导入pyplot之前设置后端
+import matplotlib.pyplot as plt
 
-# 导入 IMDB 数据集（使用 torchtext 或 keras 的数据集）
-# 注意：这里使用 keras 的 IMDB 数据集，然后转换为 PyTorch 张量
+# 导入本地 IMDB 数据集（从 aclImdb 目录）
 import numpy as np
-from keras.datasets import imdb
-from keras.preprocessing.sequence import pad_sequences
+import os
+import re
+from collections import Counter
 
 # ==================== 定义超参数 ====================
 '''
@@ -58,36 +69,158 @@ EPOCHS = 10              # 训练轮数
 LEARNING_RATE = 0.001    # 学习率（对应 Keras 中的 RMSprop 学习率）
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')  # 使用 GPU 或 CPU
 
+# ==================== 辅助函数 ====================
+def pad_sequences(sequences, maxlen, padding='pre', truncating='pre', value=0):
+    """
+    将整数序列列表填充到相同长度（自定义实现，替换Keras的pad_sequences）
+
+    参数:
+        sequences: 整数序列列表
+        maxlen: 目标序列长度
+        padding: 'pre'或'post'，表示在前面或后面填充
+        truncating: 'pre'或'post'，表示从前面或后面截断
+        value: 填充值
+
+    返回:
+        numpy数组，形状为 (len(sequences), maxlen)
+    """
+    result = np.full((len(sequences), maxlen), value, dtype=np.int64)
+    for i, seq in enumerate(sequences):
+        if len(seq) == 0:
+            continue
+        if truncating == 'pre':
+            trunc = seq[-maxlen:]
+        else:
+            trunc = seq[:maxlen]
+
+        if padding == 'pre':
+            result[i, -len(trunc):] = trunc
+        else:
+            result[i, :len(trunc)] = trunc
+    return result
+
+
+def text_to_sequence(text, word_index, max_words=VOCABULARY):
+    """
+    将文本转换为整数序列
+
+    参数:
+        text: 原始文本字符串
+        word_index: 单词到索引的字典映射
+        max_words: 词汇表大小限制
+
+    返回:
+        整数列表，单词索引序列
+    """
+    # 转换为小写并分词（简单分词）
+    words = re.findall(r'\b\w+\b', text.lower())
+    # 映射单词到索引，忽略未登录词（用0表示）
+    # 注意：索引从1开始（0用于填充）
+    sequence = []
+    for word in words:
+        if word in word_index:
+            idx = word_index[word]
+            if idx < max_words:  # 只保留前max_words个单词
+                sequence.append(idx)
+    return sequence
+
+
 # ==================== 数据加载和预处理函数 ====================
 def load_imdb_data():
     """
-    加载和预处理 IMDB 数据集，与 Keras 版本保持一致
+    加载和预处理本地 IMDB 数据集（从 aclImdb 目录）
 
     返回:
         train_loader: 训练数据 DataLoader
         valid_loader: 验证数据 DataLoader
         test_loader: 测试数据 DataLoader
     """
-    print("Loading IMDB dataset...\n")  # 打印加载数据集的提示信息
+    print("Loading local IMDB dataset from aclImdb directory...\n")
 
-    # 加载 IMDB 数据集，只保留前10000个最常见的单词
-    # x_train, x_test: 整数序列列表，每个整数代表一个单词（基于频率的索引）
-    # y_train, y_test: 二进制标签列表（0表示负面评论，1表示正面评论）
-    (x_train, y_train), (x_test, y_test) = imdb.load_data(num_words=VOCABULARY)
+    # 数据集路径
+    base_path = os.path.join(os.path.dirname(__file__), "..", "dataset", "aclImdb")
+    train_dir = os.path.join(base_path, "train")
+    test_dir = os.path.join(base_path, "test")
 
-    # 将序列填充到固定长度 WORD_NUM（500）
-    # 长度不足500的序列会在前面补0，长度超过500的序列会被截断
-    x_train = pad_sequences(x_train, maxlen=WORD_NUM)
-    x_test = pad_sequences(x_test, maxlen=WORD_NUM)
+    # 1. 加载词汇表
+    vocab_path = os.path.join(base_path, "imdb.vocab")
+    with open(vocab_path, 'r', encoding='utf-8') as f:
+        vocab = [line.strip() for line in f]
 
-    # 从测试集中划分出验证集（前5000个样本作为验证集，其余作为测试集）
+    # 构建单词到索引的映射（索引从1开始，0用于填充）
+    word_index = {word: i+1 for i, word in enumerate(vocab)}
+    print(f"Loaded vocabulary with {len(vocab)} words")
+
+    # 2. 加载训练数据
+    print("Loading training data...")
+    train_texts = []
+    train_labels = []
+
+    # 加载正面评论 (label=1)
+    pos_dir = os.path.join(train_dir, "pos")
+    for filename in os.listdir(pos_dir):
+        if filename.endswith('.txt'):
+            with open(os.path.join(pos_dir, filename), 'r', encoding='utf-8') as f:
+                text = f.read()
+            train_texts.append(text)
+            train_labels.append(1)  # 正面评论标签为1
+
+    # 加载负面评论 (label=0)
+    neg_dir = os.path.join(train_dir, "neg")
+    for filename in os.listdir(neg_dir):
+        if filename.endswith('.txt'):
+            with open(os.path.join(neg_dir, filename), 'r', encoding='utf-8') as f:
+                text = f.read()
+            train_texts.append(text)
+            train_labels.append(0)  # 负面评论标签为0
+
+    print(f"Loaded {len(train_texts)} training samples ({len(train_labels)} labels)")
+
+    # 3. 加载测试数据
+    print("Loading test data...")
+    test_texts = []
+    test_labels = []
+
+    # 加载正面评论 (label=1)
+    pos_dir = os.path.join(test_dir, "pos")
+    for filename in os.listdir(pos_dir):
+        if filename.endswith('.txt'):
+            with open(os.path.join(pos_dir, filename), 'r', encoding='utf-8') as f:
+                text = f.read()
+            test_texts.append(text)
+            test_labels.append(1)
+
+    # 加载负面评论 (label=0)
+    neg_dir = os.path.join(test_dir, "neg")
+    for filename in os.listdir(neg_dir):
+        if filename.endswith('.txt'):
+            with open(os.path.join(neg_dir, filename), 'r', encoding='utf-8') as f:
+                text = f.read()
+            test_texts.append(text)
+            test_labels.append(0)
+
+    print(f"Loaded {len(test_texts)} test samples ({len(test_labels)} labels)")
+
+    # 4. 将文本转换为整数序列
+    print("Converting texts to sequences...")
+    train_sequences = [text_to_sequence(text, word_index, VOCABULARY) for text in train_texts]
+    test_sequences = [text_to_sequence(text, word_index, VOCABULARY) for text in test_texts]
+
+    # 5. 序列填充
+    print(f"Padding sequences to length {WORD_NUM}...")
+    x_train = pad_sequences(train_sequences, maxlen=WORD_NUM, padding='pre', truncating='pre')
+    x_test = pad_sequences(test_sequences, maxlen=WORD_NUM, padding='pre', truncating='pre')
+
+    y_train = np.array(train_labels, dtype=np.float32)
+    y_test = np.array(test_labels, dtype=np.float32)
+
+    # 6. 从测试集中划分出验证集（前5000个样本作为验证集，与Keras版本保持一致）
     x_valid = x_test[:5000]   # 验证集特征
     y_valid = y_test[:5000]   # 验证集标签
     x_test = x_test[5000:]    # 测试集特征（剩余样本）
     y_test = y_test[5000:]    # 测试集标签（剩余样本）
 
-    # 将 numpy 数组转换为 PyTorch 张量
-    # 注意：需要转换为 long 类型（因为嵌入层需要整数索引）
+    # 7. 将 numpy 数组转换为 PyTorch 张量
     x_train_tensor = torch.LongTensor(x_train)
     y_train_tensor = torch.FloatTensor(y_train).unsqueeze(1)  # 添加维度以匹配模型输出
 
@@ -97,7 +230,7 @@ def load_imdb_data():
     x_test_tensor = torch.LongTensor(x_test)
     y_test_tensor = torch.FloatTensor(y_test).unsqueeze(1)
 
-    # 创建 TensorDataset 和 DataLoader
+    # 8. 创建 TensorDataset 和 DataLoader
     train_dataset = TensorDataset(x_train_tensor, y_train_tensor)
     valid_dataset = TensorDataset(x_valid_tensor, y_valid_tensor)
     test_dataset = TensorDataset(x_test_tensor, y_test_tensor)
@@ -106,7 +239,7 @@ def load_imdb_data():
     valid_loader = DataLoader(valid_dataset, batch_size=BATCH_SIZE, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
-    print("Data loaded and preprocessed \n")  # 打印数据加载完成提示信息
+    print("Data loaded and preprocessed \n")
     print(f"训练集大小: {len(train_dataset)}")
     print(f"验证集大小: {len(valid_dataset)}")
     print(f"测试集大小: {len(test_dataset)}")
@@ -354,6 +487,68 @@ def evaluate_model(model, test_loader):
     return avg_test_loss, avg_test_acc
 
 
+# ==================== 可视化函数 ====================
+def plot_training_history(history, test_loss=None, test_acc=None):
+    """
+    绘制训练曲线图像
+
+    参数:
+        history: 训练历史记录字典，包含 'train_loss', 'train_acc', 'val_loss', 'val_acc'
+        test_loss: 测试损失值（可选，保留用于向后兼容但在此图中未使用）
+        test_acc: 测试准确率（可选），在图中显示为水平线
+    """
+    # 显式忽略 test_loss 参数（在此图中未使用，但保留用于向后兼容）
+    _ = test_loss
+
+    # 创建单一图形，使用双纵坐标轴
+    fig, ax1 = plt.subplots(figsize=(10, 6))
+
+    # 提取训练历史数据
+    epochs = range(1, len(history['train_loss']) + 1)
+
+    # 左侧纵坐标：Loss (训练损失)
+    color = 'tab:blue'
+    ax1.set_xlabel('Epochs', fontsize=12)
+    ax1.set_ylabel('Training Loss', color=color, fontsize=12)
+    ax1.plot(epochs, history['train_loss'], color=color, linewidth=2, label='Training Loss')
+    ax1.tick_params(axis='y', labelcolor=color)
+    ax1.grid(True, alpha=0.3)
+
+    # 右侧纵坐标：Accuracy (训练准确率和测试准确率)
+    ax2 = ax1.twinx()
+    color = 'tab:red'
+    ax2.set_ylabel('Accuracy', color=color, fontsize=12)
+
+    # 训练准确率曲线
+    ax2.plot(epochs, history['train_acc'], color=color, linewidth=2, label='Training Accuracy')
+
+    # 测试准确率水平线（如果提供）
+    if test_acc is not None:
+        ax2.axhline(y=test_acc, color='tab:green', linestyle='--', linewidth=2,
+                   label=f'Test Accuracy: {test_acc:.4f}')
+
+    ax2.tick_params(axis='y', labelcolor=color)
+
+    # 设置标题
+    ax1.set_title('Bidirectional LSTM Training Curves', fontsize=14, fontweight='bold')
+
+    # 合并图例
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper center',
+               bbox_to_anchor=(0.5, -0.15), ncol=3, fontsize=10)
+
+    # 调整布局
+    fig.tight_layout()
+
+    # 保存图像
+    plt.savefig('bidirectional_lstm_training_curves.png', dpi=300, bbox_inches='tight')
+    print("Training curves saved to 'bidirectional_lstm_training_curves.png'")
+
+    # 显示图像（注释掉以避免在无GUI环境中出错）
+    # plt.show()
+
+
 # ==================== 主程序 ====================
 def main():
     """
@@ -396,7 +591,11 @@ def main():
     print(f"\nTest accuracy: {test_acc:.4f}")
     print(f"Test loss: {test_loss:.4f}")
 
-    # 6. 可选：保存模型
+    # 6. 绘制训练曲线图像
+    print("\nGenerating training curves...")
+    plot_training_history(history, test_loss, test_acc)
+
+    # 7. 可选：保存模型
     # torch.save(trained_model.state_dict(), 'bidirectional_lstm_model.pth')
     # print("Model saved to bidirectional_lstm_model.pth")
 
