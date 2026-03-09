@@ -39,11 +39,15 @@ import matplotlib.pyplot as plt
 # ==================== Hyperparameters ====================
 SEQ_LENGTH = 60        # 输入序列长度
 STRIDE = 3             # 滑动窗口步长
-BATCH_SIZE = 128       # 批次大小
-EPOCHS = 20            # 训练轮数
-LEARNING_RATE = 0.01   # 学习率
-EMBEDDING_DIM = 50     # 字符嵌入维度（可调整）
-HIDDEN_DIM = 128       # LSTM隐藏层维度
+BATCH_SIZE = 256       # 批次大小（增加以稳定训练）
+EPOCHS = 30            # 训练轮数（增加）
+LEARNING_RATE = 0.001  # 学习率（降低以避免震荡）
+EMBEDDING_DIM = 128    # 字符嵌入维度（增加以捕捉更多特征）
+HIDDEN_DIM = 256       # LSTM隐藏层维度（增加模型容量）
+NUM_LAYERS = 2         # LSTM层数
+DROPOUT_RATE = 0.3     # Dropout率（防止过拟合）
+WEIGHT_DECAY = 1e-4    # L2正则化（权重衰减）
+LABEL_SMOOTHING = 0.1  # 标签平滑参数（提高泛化能力）
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # ==================== Data Loading and Preprocessing ====================
@@ -154,6 +158,43 @@ class CharLSTM(nn.Module):
         # 全连接输出层：预测下一个字符的概率分布
         self.fc = nn.Linear(hidden_dim, vocab_size)
 
+class ImprovedCharLSTM(nn.Module):
+    """
+    改进的字符级LSTM模型用于文本生成
+
+    模型架构:
+    Embedding → LSTM (2层, dropout) → Dense(softmax)
+
+    输入: (batch_size, seq_length) 整数索引
+    输出: (batch_size, vocab_size) 下一个字符的概率分布
+    """
+
+    def __init__(self, vocab_size, embedding_dim, hidden_dim, seq_length, num_layers=2, dropout=0.2):
+        super(ImprovedCharLSTM, self).__init__()
+
+        self.vocab_size = vocab_size
+        self.seq_length = seq_length
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+
+        # 嵌入层：将字符索引转换为密集向量
+        self.embedding = nn.Embedding(vocab_size, embedding_dim)
+
+        # LSTM层：多层LSTM，添加dropout
+        self.lstm = nn.LSTM(
+            input_size=embedding_dim,
+            hidden_size=hidden_dim,
+            batch_first=True,
+            num_layers=num_layers,
+            dropout=dropout if num_layers > 1 else 0
+        )
+
+        # Dropout层防止过拟合
+        self.dropout = nn.Dropout(dropout)
+
+        # 全连接输出层：预测下一个字符的概率分布
+        self.fc = nn.Linear(hidden_dim, vocab_size)
+
     def forward(self, x):
         # x形状: (batch_size, seq_length)
 
@@ -162,11 +203,13 @@ class CharLSTM(nn.Module):
 
         # LSTM层: (batch_size, seq_length, embedding_dim) →
         # output: (batch_size, seq_length, hidden_dim)
-        # hidden: (hidden states)
         lstm_out, _ = self.lstm(embedded)
 
         # 只取最后一个时间步的输出: (batch_size, hidden_dim)
         last_output = lstm_out[:, -1, :]
+
+        # 应用dropout
+        last_output = self.dropout(last_output)
 
         # 全连接层: (batch_size, hidden_dim) → (batch_size, vocab_size)
         # 注意：不使用softmax，因为CrossEntropyLoss内部会处理
@@ -228,6 +271,48 @@ class CharLSTM(nn.Module):
 
         return generated
 
+# ==================== Label Smoothing Loss ====================
+class LabelSmoothingCrossEntropyLoss(nn.Module):
+    """
+    标签平滑交叉熵损失
+    有助于防止模型对训练标签过于自信，提高泛化能力
+    """
+
+    def __init__(self, smoothing=0.1, reduction='mean'):
+        super(LabelSmoothingCrossEntropyLoss, self).__init__()
+        self.smoothing = smoothing
+        self.reduction = reduction
+
+    def forward(self, logits, targets):
+        """
+        参数:
+            logits: 模型输出，形状 (batch_size, num_classes)
+            targets: 目标标签，形状 (batch_size,)
+
+        返回:
+            平滑后的交叉熵损失
+        """
+        num_classes = logits.size(-1)
+
+        # 将目标转换为one-hot编码
+        with torch.no_grad():
+            targets_onehot = torch.zeros_like(logits)
+            targets_onehot.scatter_(1, targets.unsqueeze(1), 1.0)
+
+            # 应用标签平滑
+            targets_onehot = targets_onehot * (1 - self.smoothing) + self.smoothing / num_classes
+
+        # 计算交叉熵损失
+        log_probs = torch.log_softmax(logits, dim=-1)
+        loss = -(targets_onehot * log_probs).sum(dim=-1)
+
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss
+
 # ==================== Training Function ====================
 def train_model(model, train_loader, val_loader, epochs, learning_rate, char_to_idx, idx_to_char):
     """
@@ -248,17 +333,32 @@ def train_model(model, train_loader, val_loader, epochs, learning_rate, char_to_
     """
     model = model.to(DEVICE)
 
-    # 损失函数：交叉熵损失（对应categorical_crossentropy）
-    criterion = nn.CrossEntropyLoss()
+    # 损失函数：带标签平滑的交叉熵损失（提高泛化能力）
+    if LABEL_SMOOTHING > 0:
+        criterion = LabelSmoothingCrossEntropyLoss(smoothing=LABEL_SMOOTHING)
+    else:
+        criterion = nn.CrossEntropyLoss()
 
-    # 优化器：RMSprop（与Keras保持一致）
-    optimizer = optim.RMSprop(model.parameters(), lr=learning_rate)
+    # 优化器：AdamW（比RMSprop更好的优化器，带权重衰减）
+    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=WEIGHT_DECAY)
+
+    # 学习率调度器：在验证损失停止改善时降低学习率
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=3, verbose=True
+    )
+
+    # 早停机制
+    early_stopping_patience = 5
+    best_val_loss = float('inf')
+    early_stopping_counter = 0
+    best_model_state = None
 
     history = {
         'train_loss': [],
         'train_acc': [],
         'val_loss': [],
-        'val_acc': []
+        'val_acc': [],
+        'learning_rate': []
     }
 
     print("Training model...\n")
@@ -317,16 +417,32 @@ def train_model(model, train_loader, val_loader, epochs, learning_rate, char_to_
         avg_val_loss = val_loss / val_total
         avg_val_acc = val_correct / val_total
 
+        # 记录当前学习率
+        current_lr = optimizer.param_groups[0]['lr']
+        history['learning_rate'].append(current_lr)
+
         # 记录历史
         history['train_loss'].append(avg_train_loss)
         history['train_acc'].append(avg_train_acc)
         history['val_loss'].append(avg_val_loss)
         history['val_acc'].append(avg_val_acc)
 
+        # 更新学习率调度器
+        scheduler.step(avg_val_loss)
+
+        # 检查是否是最佳模型
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            best_model_state = model.state_dict()
+            early_stopping_counter = 0
+        else:
+            early_stopping_counter += 1
+
         # 打印进度
         print(f"Epoch {epoch+1}/{epochs} - "
               f"Train Loss: {avg_train_loss:.4f}, Train Acc: {avg_train_acc:.4f} - "
-              f"Val Loss: {avg_val_loss:.4f}, Val Acc: {avg_val_acc:.4f}")
+              f"Val Loss: {avg_val_loss:.4f}, Val Acc: {avg_val_acc:.4f} - "
+              f"LR: {current_lr:.6f}")
 
         # 每个epoch后生成示例文本
         if (epoch + 1) % 5 == 0:
@@ -342,6 +458,16 @@ def train_model(model, train_loader, val_loader, epochs, learning_rate, char_to_
             print(generated)
             print("---\n")
 
+        # 检查早停条件
+        if early_stopping_counter >= early_stopping_patience:
+            print(f"\nEarly stopping triggered at epoch {epoch+1}")
+            break
+
+    # 加载最佳模型
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+        print("\nLoaded best model from validation checkpoint.")
+
     return model, history
 
 # ==================== Visualization Function ====================
@@ -352,27 +478,37 @@ def plot_training_history(history):
     参数:
         history: 训练历史记录
     """
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+    fig, axes = plt.subplots(1, 3, figsize=(18, 4))
 
     epochs = range(1, len(history['train_loss']) + 1)
 
     # 损失曲线
-    ax1.plot(epochs, history['train_loss'], 'b-', label='Training Loss')
-    ax1.plot(epochs, history['val_loss'], 'r-', label='Validation Loss')
-    ax1.set_xlabel('Epochs')
-    ax1.set_ylabel('Loss')
-    ax1.set_title('Training and Validation Loss')
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
+    axes[0].plot(epochs, history['train_loss'], 'b-', label='Training Loss')
+    axes[0].plot(epochs, history['val_loss'], 'r-', label='Validation Loss')
+    axes[0].set_xlabel('Epochs')
+    axes[0].set_ylabel('Loss')
+    axes[0].set_title('Training and Validation Loss')
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
 
     # 准确率曲线
-    ax2.plot(epochs, history['train_acc'], 'b-', label='Training Accuracy')
-    ax2.plot(epochs, history['val_acc'], 'r-', label='Validation Accuracy')
-    ax2.set_xlabel('Epochs')
-    ax2.set_ylabel('Accuracy')
-    ax2.set_title('Training and Validation Accuracy')
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
+    axes[1].plot(epochs, history['train_acc'], 'b-', label='Training Accuracy')
+    axes[1].plot(epochs, history['val_acc'], 'r-', label='Validation Accuracy')
+    axes[1].set_xlabel('Epochs')
+    axes[1].set_ylabel('Accuracy')
+    axes[1].set_title('Training and Validation Accuracy')
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+
+    # 学习率曲线
+    if 'learning_rate' in history and history['learning_rate']:
+        axes[2].plot(epochs, history['learning_rate'], 'g-', label='Learning Rate')
+        axes[2].set_xlabel('Epochs')
+        axes[2].set_ylabel('Learning Rate')
+        axes[2].set_title('Learning Rate Schedule')
+        axes[2].legend()
+        axes[2].grid(True, alpha=0.3)
+        axes[2].set_yscale('log')  # 对数刻度更好地显示学习率变化
 
     plt.tight_layout()
     plt.savefig('text_generation_training_curves.png', dpi=300)
@@ -410,13 +546,15 @@ def main():
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
-    # 5. 创建模型
+    # 5. 创建改进的模型
     vocab_size = len(chars)
-    model = CharLSTM(
+    model = ImprovedCharLSTM(
         vocab_size=vocab_size,
         embedding_dim=EMBEDDING_DIM,
         hidden_dim=HIDDEN_DIM,
-        seq_length=SEQ_LENGTH
+        seq_length=SEQ_LENGTH,
+        num_layers=NUM_LAYERS,
+        dropout=DROPOUT_RATE
     )
 
     print(f"\nModel created with vocabulary size: {vocab_size}")
